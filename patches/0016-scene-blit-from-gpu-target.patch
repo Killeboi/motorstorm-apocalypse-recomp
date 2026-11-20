@@ -1,0 +1,202 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7d..d5199e9 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1245,6 +1245,33 @@ static void nv3089_blit(void)
+     u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
+     u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
+     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
++    /* GCM_RT_BLIT_COMPOSITE=1 (MotorStorm port): follow a rendered surface through main memory.
++     * A blit FROM an offscreen target the GPU backend holds, into main memory, makes that
++     * destination an alias of the target; a later full-display-size blit FROM the alias into
++     * local memory is the title putting its (SPU post-processed) frame on the display buffer.
++     * The pixels are only on the GPU, so ask the backend to draw the target there instead.
++     * The guest-memory copies below still run. */
++    { static int en = -1;
++      if (en < 0) { const char* e = getenv("GCM_RT_BLIT_COMPOSITE"); en = e ? atoi(e) : 0; }
++      if (en) {
++          extern int  rsx_d3d12_offscreen_rt_exists(u32 raw_off);
++          extern void rsx_d3d12_blit_rt_to_display(u32 raw_off);
++          static struct { u32 main_ea, rt_off; } alias[8]; static int n_alias = 0;
++          if (src_local && !dst_local && !s_nv3089.in_uv && !s_nv3089.out_pt &&
++              rsx_d3d12_offscreen_rt_exists(s_nv3089.in_off)) {
++              int i = 0;
++              for (; i < n_alias; i++) if (alias[i].main_ea == dst) break;
++              if (i == n_alias && n_alias < 8) n_alias++;
++              if (i < 8) {
++                  if (alias[i].main_ea != dst || alias[i].rt_off != s_nv3089.in_off)
++                      printf("[NV3089] main 0x%08X now aliases offscreen target 0x%08X%c", dst, s_nv3089.in_off, 10);
++                  alias[i].main_ea = dst; alias[i].rt_off = s_nv3089.in_off;
++              }
++          } else if (!src_local && dst_local && out_w >= 1280 && out_h >= 720) {
++              for (int i = 0; i < n_alias; i++)
++                  if (alias[i].main_ea == src) { rsx_d3d12_blit_rt_to_display(alias[i].rt_off); break; }
++          }
++      } }
+     /* Clip to SET_CLIP_POINT/SIZE (destination coordinates). A title tiling a
+      * resolve in 512x512 blocks relies on it to stop at the surface edge:
+      * Tornado Outbreak's bottom band is 512 rows tall with 208 left in the
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 3a6227b..18e5f2d 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -387,6 +387,8 @@ typedef struct {
+     ID3D12DescriptorHeap* ds_heap;              /* one DSV per OffDS              */
+     ID3D12RootSignature*  dsconv_rs;            /* depth -> guest colour bytes    */
+     ID3D12PipelineState*  dsconv_pso;
++    ID3D12RootSignature*  sblit_rs;             /* offscreen RT -> backbuffer, scaled */
++    ID3D12PipelineState*  sblit_pso;
+     /* DRAW_ARRAYS batch merging (see d3d12_draw_arrays): the vertex index one
+      * past the last batch, and whether the current BEGIN/END may still be
+      * extended. */
+@@ -4353,6 +4355,118 @@ static void ds_convert(int i, int rt)
+     s_d3d.off_ds[i].conv_gen = s_d3d.off_ds[i].gen;
+ }
+ 
++/* MotorStorm port: GPU-side stand-in for "copy the scene to main memory, post-process it on the
++ * SPU, blit it to the display buffer". The title renders its scene into an offscreen target,
++ * moves it to main memory with NV3089 tiles, runs MLAA there on the SPU and blits the result
++ * (scaled 1280x1080 -> 1280x720) into the display buffer, then draws the UI on top. The scene
++ * only exists on the GPU here, so the guest-memory chain moves zeros and the backdrop is black.
++ * cellGcmSys (GCM_RT_BLIT_COMPOSITE=1) recognises the final blit and calls this: at the same
++ * place in the op order, draw that target, scaled, into the backbuffer.
++ * s_sblit_at is the number of ops recorded when the blit came; 0xFFFFFFFF = none pending. */
++static u32 s_sblit_src = 0, s_sblit_at = 0xFFFFFFFFu;
++int rsx_d3d12_offscreen_rt_exists(u32 raw_off) { return off_rt_find(raw_off) >= 0; }
++void rsx_d3d12_blit_rt_to_display(u32 raw_off)
++{
++    s_sblit_src = raw_off;
++    s_sblit_at  = s_d3d.draw_count;
++}
++static int sblit_init(void)
++{
++    if (s_d3d.sblit_pso) return 1;
++    static int failed = 0;
++    if (failed) return 0;
++    failed = 1;
++    static const char vs[] =
++        "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
++        "O main(uint id : SV_VertexID) {\n"
++        "    O o; float2 t = float2((id << 1) & 2, id & 2);\n"
++        "    o.uv = t; o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); return o;\n"
++        "}\n";
++    static const char ps[] =
++        "Texture2D src : register(t0);\n"
++        "SamplerState lin : register(s0);\n"
++        "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
++        "    return float4(src.SampleLevel(lin, uv, 0).rgb, 1);\n"
++        "}\n";
++    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
++    if (FAILED(D3DCompile(vs, sizeof vs - 1, "sblit_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
++        FAILED(D3DCompile(ps, sizeof ps - 1, "sblit_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
++        printf("[D3D12] scene blit shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
++        return 0;
++    }
++    D3D12_DESCRIPTOR_RANGE rg = {0};
++    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    rg.NumDescriptors = 1;
++    D3D12_ROOT_PARAMETER rp = {0};
++    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    rp.DescriptorTable.NumDescriptorRanges = 1;
++    rp.DescriptorTable.pDescriptorRanges = &rg;
++    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_STATIC_SAMPLER_DESC ss = {0};
++    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    ss.MaxLOD = D3D12_FLOAT32_MAX;
++    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC rd = {0};
++    rd.NumParameters = 1; rd.pParameters = &rp;
++    rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
++    ID3DBlob* sig = NULL;
++    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
++        FAILED(s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
++               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_d3d.sblit_rs)))
++        return 0;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
++    pd.pRootSignature = s_d3d.sblit_rs;
++    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
++    pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
++    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
++    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
++    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    pd.RasterizerState.DepthClipEnable = TRUE;
++    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    pd.SampleMask = UINT_MAX;
++    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    pd.NumRenderTargets = 1;
++    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++    pd.SampleDesc.Count = 1;
++    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
++            s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_d3d.sblit_pso)))
++        return 0;
++    failed = 0;
++    return 1;
++}
++/* Draw offscreen target `raw_off` over the whole backbuffer. Leaves the guest path's root
++ * signature, heaps and targets unbound (the caller rebinds, as after ds_convert). Returns 1
++ * if it drew. */
++static int sblit_draw(u32 raw_off, D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv)
++{
++    const int rt = off_rt_find(raw_off);
++    if (rt < 0 || !s_d3d.off_rt[rt].res || !sblit_init()) return 0;
++    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
++    { static int n = 0;
++      if (PS3_LOG_FIRST(n, 3))
++          fprintf(stderr, "[D3D12] scene blit: rt 0x%08X %ux%u dxgi=%u -> backbuffer%c", raw_off,
++                  s_d3d.off_rt[rt].w, s_d3d.off_rt[rt].h, s_d3d.off_rt[rt].dxgi, 10); }
++    off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    cl->lpVtbl->OMSetRenderTargets(cl, 1, &bb_rtv, FALSE, NULL);
++    D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
++    D3D12_RECT sc = {0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height};
++    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
++    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
++    cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.sblit_rs);
++    cl->lpVtbl->SetPipelineState(cl, s_d3d.sblit_pso);
++    ID3D12DescriptorHeap* hp[] = { s_d3d.srv_heap };
++    cl->lpVtbl->SetDescriptorHeaps(cl, 1, hp);
++    D3D12_GPU_DESCRIPTOR_HANDLE gh;
++    s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
++    gh.ptr += (u64)(RT_SRV_BASE + rt) * s_d3d.srv_inc;
++    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
++    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
++    return 1;
++}
++
+ /* Set by the present entry point: 1 = this batch ends with a swapchain
+  * Present, 0 = execute the recorded draws only. An OFFSCREEN-only batch (a
+  * render-to-texture pass) must still run -- it is what fills the texture a
+@@ -5319,10 +5433,29 @@ static void render_frame(void)
+             int cur_z = -1, cur_nc = 0, force_rebind = 0;   /* OffDS bound (-1 = shared buffer) */
+             D3D12_CPU_DESCRIPTOR_HANDLE cur_dsv = dsv_handle;
+             double _rec0 = perf_on() ? perf_now() : 0.0;
+-            int seen_small_vp = 0, captured = 0;
+-            for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
++            int seen_small_vp = 0, captured = 0, sblit_done_this_frame = 0;
++            for (u32 d = 0; d <= s_d3d.draw_count && d <= MAX_DRAWS; d++) {
++                /* The scene blit, at the op position the guest's display blit came in. */
++                if (s_sblit_at != 0xFFFFFFFFu && d >= s_sblit_at) {
++                    s_sblit_at = 0xFFFFFFFFu;
++                    if (sblit_draw(s_sblit_src, rtv_handle)) {
++                        sblit_done_this_frame = 1;
++                        s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
++                        { ID3D12DescriptorHeap* hp2[] = { s_d3d.srv_heap, s_d3d.samp_heap };
++                          s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, hp2); }
++                        for (int _s = 0; _s < VP_TEX_UNITS; _s++) samp_bound[_s] = -1;
++                        force_rebind = 1;
++                    }
++                }
++                if (d >= s_d3d.draw_count || d >= MAX_DRAWS) break;
+                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
+                 if (!dr->is_vp) continue;
++                /* GCM_RT_BLIT_DEBUG=1: drop the display-surface ops that follow the scene blit,
++                 * so a capture shows the blit alone (the title fades its backdrop with a
++                 * full-screen quad on some screens, which hides whether the blit landed). */
++                { static int dbg = -1;
++                  if (dbg < 0) { const char* e = getenv("GCM_RT_BLIT_DEBUG"); dbg = e ? atoi(e) : 0; }
++                  if (dbg && sblit_done_this_frame && !dr->rt_off) continue; }
+                 for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
+                     const int ds = dr->tex_ds[_u];
+                     if (ds < 0 || ds == cur_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)

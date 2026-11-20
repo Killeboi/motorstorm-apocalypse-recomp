@@ -1,0 +1,126 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc5020..7329f7c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2051,6 +2051,11 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+     const uint8_t* p = ctx->ls + 0x2794; /* SpursTasksetContext.taskInfo.elf */
+     uint32_t elf = (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3]) & ~7u;
++    { static int s_d = -1; if (s_d < 0) s_d = getenv("SPU_TASKELF_DEBUG") ? 1 : 0;
++      static volatile int s_n = 0;
++      if (s_d && ctx->spu_id == 0x2005 && s_n++ < 16)
++          fprintf(stderr, "[task-elf] spu=0x%X pc=0x%05X elf@2794=0x%08X ovl=%d registered=%d\n",
++                  ctx->spu_id, ctx->pc & SPU_LS_MASK, elf, ctx->resident_ovl, s_task_elf_count); }
+     for (int i = 0; i < s_task_elf_count; ++i)
+         if (s_task_elf[i].elf_ea == elf &&
+             s_task_elf[i].policy_image_id == ctx->resident_ovl)
+@@ -2239,6 +2244,33 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
+                 (unsigned)bits, wobj); }
+ }
+ 
++/* SPU_TASKSET_FORCE_HLE=<hex EA>[,<hex EA>...]: tasksets whose task syscalls (LS 0xA70)
++ * are served by the HLE below even when the real taskset policy is resident. For a title
++ * that runs an LLE SPURS kernel but has one taskset the real policy cannot yet drive here
++ * (MotorStorm: Multistream's MP3 task, taskset 0x0137A880, stops inside the policy while
++ * its code runs partly interpreted). The taskset is read from SpursTasksetContext @0x27BC. */
++int spu_taskset_force_hle(const spu_context* ctx)
++{
++    static uint32_t s_list[8]; static int s_n = -1;
++    if (s_n < 0) {
++        s_n = 0;
++        const char* e = getenv("SPU_TASKSET_FORCE_HLE");
++        while (e && *e && s_n < 8) {
++            char* end = NULL;
++            unsigned long v = strtoul(e, &end, 16);
++            if (end == e) break;
++            s_list[s_n++] = (uint32_t)v;
++            e = (*end == ',') ? end + 1 : end;
++            if (!*end) break;
++        }
++    }
++    if (!s_n) return 0;
++    const uint32_t ts = ((uint32_t)ctx->ls[0x27BC] << 24) | ((uint32_t)ctx->ls[0x27BD] << 16) |
++                        ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
++    for (int i = 0; i < s_n; i++) if (s_list[i] == ts) return 1;
++    return 0;
++}
++
+ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
+ {
+     uint32_t raw = ctx->gpr[3]._u32[0];
+@@ -2672,10 +2704,42 @@ void spu_indirect_branch(spu_context* ctx)
+          * the only alternative to the HLE is the synthesised-stop exit below
+          * -- which is how LBP's audio tasks (images 6/7) ended on their first
+          * syscall and left the loading thread waiting on their event flag. */
++        /* Also ask the full resolver: a taskset PM streamed in by an LLE SPURS kernel
++         * is resident as a verified code region (resident_code[] slot), not as
++         * resident_ovl -- the task loaded after it took that field -- so the three
++         * direct probes missed it and the real policy's syscall entry was hijacked
++         * by the HLE below (MotorStorm: edgezlib looped in HLE WAIT_SIGNAL). */
+         int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
+             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
+-            (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
+-        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
++            (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl)) ||
++            spu_lifted_lookup(ctx, SPURS_TASKSET_PM_SYSCALL_LS) != NULL;
++        /* No code at 0xA70 at all (word 0): no real policy is resident in this local
++         * store whatever the registries say, so the HLE is the only thing that can
++         * serve the syscall (MotorStorm's Multistream task resumed on an SPU that
++         * never loaded the taskset PM, and executed stop(0) at 0xA70). */
++        const int a70_empty = !ctx->ls[0xA70] && !ctx->ls[0xA71] && !ctx->ls[0xA72] && !ctx->ls[0xA73];
++        extern int spu_taskset_force_hle(const spu_context*);
++        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS &&
++                         (!lifted || a70_empty || spu_taskset_force_hle(ctx));
++        { static volatile int s_en = 0; static int s_dbg2 = -1;
++          if (s_dbg2 < 0) s_dbg2 = getenv("SPU_A70_DEBUG") ? 1 : 0;
++          if (s_dbg2 && (a70_empty || ctx->spu_id == 0x2005) && s_en++ < 12)
++              fprintf(stderr, "[a70-empty] spu=0x%X w=%02X%02X%02X%02X img=%d policy=%d sc=0x%X lifted=%d standalone=%d taskset@27BC=%02X%02X%02X%02X lr=0x%05X\n",
++                      ctx->spu_id, ctx->ls[0xA70], ctx->ls[0xA71], ctx->ls[0xA72], ctx->ls[0xA73],
++                      ctx->image_id, ctx->policy_mode, sc, lifted, standalone, ctx->ls[0x27BC], ctx->ls[0x27BD],
++                      ctx->ls[0x27BE], ctx->ls[0x27BF], ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
++        { static int s_dbg = -1; if (s_dbg < 0) s_dbg = getenv("SPU_A70_DEBUG") ? 1 : 0;
++          static volatile int s_dn = 0;
++          if (s_dbg && s_dn++ < 12) {
++              fprintf(stderr, "[a70] img=%d task=%d ovl=%d policy=%d sc=0x%X lifted=%d standalone=%d",
++                      ctx->image_id, ctx->resident_task, ctx->resident_ovl, ctx->policy_mode, sc, lifted, standalone);
++              for (unsigned s = 0; s < 4; s++)
++                  if (ctx->resident_code[s].image_id)
++                      fprintf(stderr, " slot%u{img=%d lsa=0x%X size=0x%X vs=%d}", s,
++                              ctx->resident_code[s].image_id, ctx->resident_code[s].lsa,
++                              ctx->resident_code[s].size, ctx->resident_code[s].verify_state);
++              fprintf(stderr, "\n");
++          } }
+         if (ctx->image_id == 22 || standalone ||
+             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
+             spu_spurs_taskset_syscall(ctx);
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index e9b8f61..77f8637 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -8,6 +8,7 @@
+ #include <time.h>
+ #include "spu_interp.h"
+ #include "spu_helpers.h"
++extern int spu_taskset_force_hle(const spu_context*);   /* spu_channels.c */
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -483,7 +484,17 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+         if (ctx->pc == 0xA70u) {
+             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
+                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
++            /* Same rule as the lifted path: with nothing at 0xA70 (word 0) no real
++             * policy is resident, so only the HLE can serve the task syscall. */
++            const int a70_empty = !ctx->ls[0xA70] && !ctx->ls[0xA71] && !ctx->ls[0xA72] && !ctx->ls[0xA73];
++            { static volatile int s_dn = 0; static int s_dbg = -1;
++              if (s_dbg < 0) s_dbg = getenv("SPU_A70_DEBUG") ? 1 : 0;
++              if (s_dbg && (a70_empty || ctx->spu_id == 0x2005) && s_dn++ < 12)
++                  fprintf(stderr, "[a70-interp] spu=0x%X w=%02X%02X%02X%02X img=%d policy=%d sc=0x%X taskset@27BC=%02X%02X%02X%02X lr=0x%05X\n",
++                          ctx->spu_id, ctx->ls[0xA70], ctx->ls[0xA71], ctx->ls[0xA72], ctx->ls[0xA73], ctx->image_id, ctx->policy_mode, sc, ctx->ls[0x27BC], ctx->ls[0x27BD],
++                          ctx->ls[0x27BE], ctx->ls[0x27BF], ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
++            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u) ||
++                (!ctx->policy_mode && sc == 0xA70u && (a70_empty || spu_taskset_force_hle(ctx)))) {
+                 extern void spu_spurs_taskset_syscall(spu_context*);
+                 int _save = ctx->image_id; ctx->image_id = 22;
+                 spu_spurs_taskset_syscall(ctx);

@@ -1,0 +1,93 @@
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9cb5040..04f7905 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -409,9 +409,46 @@ static void sys_lwcond_create(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
++/* Real wake-ups (MotorStorm port). The signalers used to be no-ops and every wait
++ * a fixed Sleep(1): each lwcond handshake (fios request/completion, job queues,
++ * loaders) cost >= 1 ms and a wait could only end by polling. Now each lwcond
++ * EA has a generation counter + host condition variable: signal bumps it and
++ * wakes, wait sleeps until the generation moves or the timeout ends. A waiter
++ * still returns after at most LWC_POLL_MS with no signal (a spurious wake-up,
++ * which guest predicate loops tolerate), so a signal this model misses can only
++ * cost latency, never a hang. Set PS3_LWCOND_POLL=1 for the old behaviour. */
++#include <mutex>
++#include <condition_variable>
++#include <unordered_map>
++#include <chrono>
++struct LwcState { std::mutex m; std::condition_variable cv; uint64_t gen = 0; };
++static std::mutex s_lwc_map_m;
++static std::unordered_map<uint32_t, LwcState*> s_lwc_map;
++static LwcState* lwc_state(uint32_t lwcond)
++{
++    std::lock_guard<std::mutex> g(s_lwc_map_m);
++    LwcState*& st = s_lwc_map[lwcond];
++    if (!st) st = new LwcState();
++    return st;
++}
++static int lwc_poll_mode(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("PS3_LWCOND_POLL"); v = (e && *e == '1') ? 1 : 0; }
++    return v;
++}
++static const unsigned LWC_POLL_MS = 20;
++static void lwc_signal(uint32_t lwcond, bool all)
++{
++    LwcState* st = lwc_state(lwcond);
++    { std::lock_guard<std::mutex> g(st->m); st->gen++; }
++    if (all) st->cv.notify_all(); else st->cv.notify_one();
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal((uint32_t)ctx->gpr[3], false); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal((uint32_t)ctx->gpr[3], true);  ctx->gpr[3] = 0; }
++/* signal_to(lwcond, ppu_thread_id): no per-thread queue here -- wake everyone;
++ * the others see a spurious wake-up and re-check their predicate. */
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal((uint32_t)ctx->gpr[3], true);  ctx->gpr[3] = 0; }
+ /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+  * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+@@ -427,11 +464,36 @@ static void sys_lwcond_wait(ppu_context* ctx)
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ppu_thread_note_block(ctx->thread_id);
+-        lwm_release(sl);
+-        Sleep(1);
++        int32_t ret = 0;
++        if (lwc_poll_mode()) {
++            lwm_release(sl);
++            Sleep(1);
++        } else {
++            /* Take the generation BEFORE releasing the lwmutex: a signaler can
++             * only run after the release, so its bump is never missed. */
++            LwcState* st = lwc_state(lwcond);
++            const uint64_t timeout_us = ctx->gpr[4];
++            std::unique_lock<std::mutex> lk(st->m);
++            const uint64_t g0 = st->gen;
++            lwm_release(sl);
++            const auto t0 = std::chrono::steady_clock::now();
++            const auto poll = std::chrono::milliseconds(LWC_POLL_MS);
++            bool woke;
++            if (timeout_us && timeout_us < (uint64_t)LWC_POLL_MS * 1000u) {
++                woke = st->cv.wait_for(lk, std::chrono::microseconds(timeout_us), [&] { return st->gen != g0; });
++                if (!woke) ret = (int32_t)0x8001000Bu;   /* CELL_ETIMEDOUT */
++            } else {
++                woke = st->cv.wait_for(lk, poll, [&] { return st->gen != g0; });
++                if (!woke && timeout_us &&
++                    std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(timeout_us))
++                    ret = (int32_t)0x8001000Bu;
++            }
++        }
+         lwm_acquire(sl, 0);
+         vm_write32(lwmutex + LWM_OWNER, own);
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++        ctx->gpr[3] = (uint64_t)(int64_t)ret;
++        return;
+     }
+     ctx->gpr[3] = 0;
+ }

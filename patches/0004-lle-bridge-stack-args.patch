@@ -1,0 +1,34 @@
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 15d4ef6..93ea9cc 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -463,6 +463,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+             { static int64_t st=-2; if(st==-2){const char*e=getenv("SPURS_TRACE"); st=e?1:0;}
+               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X lr=0x%08X\n",
+                   nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],(uint32_t)ctx->lr);
++              /* MotorStorm port: workload creation args (r7..r10 + 9th arg at r1+0x74 in the
++               * 64-bit ELF ABI parameter save area; maxContention for
++               * _cellSpursWorkloadAttributeInitialize) and SetMaxContention / ReadyCountStore. */
++              if (st && (nid==0xEFEB2679u || nid==0x84D2F6D5u || nid==0xF843818Du || nid==0xC0158D8Bu))
++                  fprintf(stderr, "[SPURSTRACE]   r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X stk70=0x%08X stk74=0x%08X\n",
++                      (uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8],(uint32_t)ctx->gpr[9],(uint32_t)ctx->gpr[10],
++                      vm_read32((uint32_t)ctx->gpr[1] + 0x70), vm_read32((uint32_t)ctx->gpr[1] + 0x74));
+               /* CRI task-arg trace: _cellSpursTaskAttributeInitialize (0xB8474EFF) carries the
+                * CellSpursTaskArgument (16B). Dump all 8 arg regs + the r9/r10 targets so we can
+                * find which game value becomes the task's r3 (wrong vs the RPCS3 dump). */
+@@ -650,6 +657,15 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+              * Opt out with YDKJ_NO_REENTRY_ISO=1. */
+             { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
+               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
++                /* MotorStorm port: arguments 9+ are NOT in registers -- the 64-bit ELF ABI
++                 * passes them in the caller's parameter save area at r1+0x70... The callee
++                 * read them relative to the moved r1 and got zeros: libsre's
++                 * _cellSpursWorkloadAttributeInitialize lost maxContention (9th arg), every
++                 * Wws job-manager workload got wklMaxContention 0, the SPURS kernel never ran
++                 * them and the title's job system waited forever. Carry the caller's frame
++                 * header + parameter save area (0x100 bytes) over to the new slice. */
++                if ((uint32_t)_sr1 >= 0x1000u)
++                    memcpy(vm_base + (uint32_t)ctx->gpr[1], vm_base + (uint32_t)_sr1, 0x100);
+                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
+               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
+             /* A real PRX serving this import is a different implementation of it,

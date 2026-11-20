@@ -1,0 +1,131 @@
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index ed2bcf5..11f94b7 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -36,6 +36,7 @@ extern "C" {
+ #include <intrin.h>
+ #include <windows.h>   /* SwitchToThread */
+ static volatile long g_lockline = 0;
++static volatile long g_lockline_seq = 0;
+ /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
+  * pause, and yield after a long wait. The bare exchange loop let GH3's four
+  * idle job-policy pollers saturate the line and delay every other SPU atomic
+@@ -49,8 +50,22 @@ void spu_lockline_lock(void)
+             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+         } while (g_lockline);
+     }
++    _InterlockedIncrement(&g_lockline_seq);   /* odd: a writer is inside */
++}
++void spu_lockline_unlock(void)
++{
++    _InterlockedIncrement(&g_lockline_seq);   /* even again */
++    _InterlockedExchange(&g_lockline, 0);
++}
++/* MotorStorm port: a seqlock over the lock-line lock, so the unlocked GETLLAR can tell its
++ * 128-byte copy overlapped a writer. The guest inspects that copy before any PUTLLC could
++ * fail: libsre's taskset policy halts the SPU on a line whose bitmasks are inconsistent. */
++unsigned spu_lockline_seq_begin(void) { return (unsigned)g_lockline_seq; }
++int spu_lockline_seq_same(unsigned s)
++{
++    _ReadWriteBarrier(); _mm_mfence();
++    return (unsigned)g_lockline_seq == s;
+ }
+-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+ #elif defined(_WIN32)
+ /* Non-MSVC Windows keeps the plain spin, without a pthread dependency. */
+ #include <stdatomic.h>
+@@ -104,6 +119,11 @@ void spu_lockline_lock(void)
+ }
+ void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
+ #endif
++#if !defined(_MSC_VER)
++/* No seqlock on these paths: an odd value sends every GETLLAR to the locked copy. */
++unsigned spu_lockline_seq_begin(void) { return 1u; }
++int spu_lockline_seq_same(unsigned s) { (void)s; return 0; }
++#endif
+ 
+ /* ===========================================================================
+  * The reserved-line bitmap
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ea2e835..1e6cde2 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -42,6 +42,9 @@ extern "C" {
+  * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
+ void spu_lockline_lock(void);
+ void spu_lockline_unlock(void);
++/* Odd from begin = a writer is inside; same() = no writer overlapped since begin. */
++unsigned spu_lockline_seq_begin(void);
++int spu_lockline_seq_same(unsigned s);
+ 
+ /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
+  * reservation holder. Called from the SPU's GETLLAR with the lock held.
+@@ -71,7 +74,7 @@ void spu_coh_notify_write(uint32_t ea);
+ /* Remove a context from the reserving set. MUST be called before a
+  * transient (stack-allocated) spu_context goes out of scope. */
+ void spu_coh_unregister(spu_context* ctx);
+-void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
++void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
+ /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
+  * write does not cost it its reservation on hardware. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc5020..cb337af 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -192,6 +192,14 @@ void spu_halt(spu_context* ctx)
+             fprintf(stderr, " r%d=%08X", r, ctx->gpr[r]._u32[0]);
+         fprintf(stderr, " r80=%08X r85=%08X\n",
+                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
++        /* MotorStorm port: the taskset PM's state at LS 0x2700 -- running, ready, pending_ready,
++         * enabled, signalled, waiting -- names the invariant its halt at 0xF00 found broken. */
++        for (uint32_t q = 0; q < 6; q++) {
++            const uint8_t* b = ctx->ls + 0x2700u + q * 16u;
++            fprintf(stderr, "[spu-halt] LS[0x%04X]: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
++                    0x2700u + q * 16u, b[0],b[1],b[2],b[3], b[4],b[5],b[6],b[7],
++                    b[8],b[9],b[10],b[11], b[12],b[13],b[14],b[15]);
++        }
+         fflush(stderr);
+       } }
+     if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
+@@ -717,8 +730,14 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * policy-module poll -- publishes its reservation and copies without
+          * the lock; any write the copy misses ends that reservation (see
+          * spu_coh_reserve_fast). Anything else takes the lock as before. */
+-        const int llar_fast = spu_coh_reserve_fast(ctx, ea);
+-        if (!llar_fast) {
++        int llar_fast = spu_coh_reserve_fast(ctx, ea);
++        unsigned llar_seq = 0;
++        if (llar_fast) { llar_seq = spu_lockline_seq_begin(); if (llar_seq & 1u) llar_fast = -1; }
++        if (llar_fast == -1) {                         /* a writer is inside: wait for it */
++            llar_fast = 0;
++            spu_lockline_lock();
++            spu_coh_reserve(ctx, ea);
++        } else if (!llar_fast) {
+             spu_lockline_lock();
+             /* Tell the PPU store paths this line is live, so a store into it goes
+              * through the lock and raises SPU_EVENT_LR here instead of landing
+@@ -744,6 +763,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * and a store that lands after the read now leaves BOTH stale -- which
+          * is what makes the lost-reservation event fire. */
+         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
++        /* MotorStorm port: an unlocked copy that overlapped a writer may be torn, and the guest
++         * acts on it before PUTLLC could fail (taskset PM: HALT at LS 0xF00). Read it again
++         * under the lock, as the hardware's single atomic read would have seen it. */
++        if (llar_fast && !spu_lockline_seq_same(llar_seq)) {
++            static volatile long s_races = 0, s_diff = 0;
++            spu_lockline_lock();
++            spu_coh_reserve(ctx, ea);
++            llar_fast = 0;                             /* the unlock below is now ours */
++            InterlockedIncrement(&s_races);
++            if (memcmp(ls, mem, MFC_ATOMIC_LINE)) {
++                long nd = InterlockedIncrement(&s_diff);
++                if (nd <= 8 || (nd & 0xFFFF) == 0)
++                    fprintf(stderr, "[spu-llar] unlocked GETLLAR overlapped a writer and differs: ea=0x%08X pc=0x%05X (%ld differing of %ld raced)\n",
++                            ea, (unsigned)(ctx->pc & SPU_LS_MASK), nd, s_races);
++            }
++            memcpy(ls, mem, MFC_ATOMIC_LINE);
++        }
+         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
+          * single atomic 128-byte read, so the reserved data and the reservation
+          * come from the same instant. Reading guest memory twice lets a PPU store

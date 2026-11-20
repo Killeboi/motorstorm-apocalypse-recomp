@@ -1,0 +1,36 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc5020..2ac7cfd 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -339,6 +339,11 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+         /* A one-way guest stack reset invalidates every lifted host caller.
+          * Re-enter its target with the same guest state on the driver stack. */
+         ctx->host_depth = 0;
++        /* MotorStorm port: the drains these fields belong to were abandoned by the restart. A
++         * stale drain_ret_pc stops the interpreter at a return point nobody owns any more, and
++         * the driver then ends the thread (status RUNNING, reported as FAULT). */
++        ctx->drain_ret_pc = 0;
++        ctx->irq_frame = 0;
+         g_spu_trampoline_fn = 0;
+         spu_indirect_branch(ctx);
+         SPU_DRAIN(ctx);
+@@ -2872,6 +2953,19 @@ void spu_indirect_branch(spu_context* ctx)
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
+               spu_interp_run(ctx, p);
++              /* MotorStorm port: the interpreter returns when it reaches a lifted address, with
++               * the SPU still running. A nested spu_drain_call resumes from ctx->pc, but the
++               * top-level SPU_DRAIN in spu_run_with_halt sees an empty trampoline and ends the
++               * thread (status RUNNING, reported as FAULT). Queue the transfer so both continue.
++               * SPU_INTERP_NOREJOIN=1 restores the old behaviour. */
++              { static int s_nr = -1; if (s_nr < 0) s_nr = getenv("SPU_INTERP_NOREJOIN") ? 1 : 0;
++                if (!s_nr && ctx->status == SPU_STATUS_RUNNING) {
++                    static volatile long s_rj = 0;
++                    if (ctx->host_depth == 0 && s_rj++ < 16)
++                        fprintf(stderr, "[spu] interp rejoin at driver level: spu=0x%X img=%d pc=0x%05X\n",
++                                ctx->spu_id, ctx->image_id, ctx->pc & SPU_LS_MASK);
++                    g_spu_trampoline_fn = spu_indirect_branch;
++                } }
+               return;
+           } }
+         spu_halt(ctx);

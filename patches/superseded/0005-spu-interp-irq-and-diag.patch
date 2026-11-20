@@ -1,0 +1,93 @@
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 49bc2b9..b307e5b 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -575,6 +575,14 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             *tramp = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+             spu_drain_hop_inline(ctx, fn, recent);
++            /* SPU_IRQWIN_LOG=1: every interrupts-enabled hop, whether an event is pending
++             * (MotorStorm: the Wws PM's bie/bid window at LS 0x2D00 never takes its SN irq). */
++            { static int s_iw = -1; if (s_iw < 0) s_iw = getenv("SPU_IRQWIN_LOG") ? 1 : 0;
++              static volatile long s_in = 0;
++              if (s_iw && ctx->int_enable && s_in++ < 60)
++                  fprintf(stderr, "[irqwin] spu=0x%X pc=0x%05X status=0x%X mask=0x%X stallstat=0x%X parked=0x%X\n",
++                          ctx->spu_id, ctx->pc & SPU_LS_MASK, ctx->event_status, ctx->event_mask,
++                          ctx->list_stall_stat, ctx->list_stall_mask); }
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index e9b8f61..959e3d3 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -8,6 +8,7 @@
+ #include <time.h>
+ #include "spu_interp.h"
+ #include "spu_helpers.h"
++extern int spu_taskset_force_hle(const spu_context*);   /* spu_channels.c */
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -483,7 +484,17 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+         if (ctx->pc == 0xA70u) {
+             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
+                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
++            /* Same rule as the lifted path: with nothing at 0xA70 (word 0) no real
++             * policy is resident, so only the HLE can serve the task syscall. */
++            const int a70_empty = !ctx->ls[0xA70] && !ctx->ls[0xA71] && !ctx->ls[0xA72] && !ctx->ls[0xA73];
++            { static volatile int s_dn = 0; static int s_dbg = -1;
++              if (s_dbg < 0) s_dbg = getenv("SPU_A70_DEBUG") ? 1 : 0;
++              if (s_dbg && (a70_empty || ctx->spu_id == 0x2005) && s_dn++ < 12)
++                  fprintf(stderr, "[a70-interp] spu=0x%X w=%02X%02X%02X%02X img=%d policy=%d sc=0x%X taskset@27BC=%02X%02X%02X%02X lr=0x%05X\n",
++                          ctx->spu_id, ctx->ls[0xA70], ctx->ls[0xA71], ctx->ls[0xA72], ctx->ls[0xA73], ctx->image_id, ctx->policy_mode, sc, ctx->ls[0x27BC], ctx->ls[0x27BD],
++                          ctx->ls[0x27BE], ctx->ls[0x27BF], ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
++            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u) ||
++                (!ctx->policy_mode && sc == 0xA70u && (a70_empty || spu_taskset_force_hle(ctx)))) {
+                 extern void spu_spurs_taskset_syscall(spu_context*);
+                 int _save = ctx->image_id; ctx->image_id = 22;
+                 spu_spurs_taskset_syscall(ctx);
+@@ -499,6 +510,42 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
+         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         g_spu_interp_last_pc = ctx->pc;
++        /* Asynchronous SPU interrupts in interpreted code (MotorStorm port). The lifted
++         * dispatcher takes a pending interrupt after every transfer while int_enable is set;
++         * the interpreter never checked, so a bie/bid window (the Wws job-manager PM spins in
++         * one at LS 0x2D00 waiting for its DMA-list stall-and-notify interrupt) could never
++         * fire. SPU_INTERP_NOIRQ=1 restores the old behaviour. */
++        if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
++            static int s_ni = -1; if (s_ni < 0) s_ni = getenv("SPU_INTERP_NOIRQ") ? 1 : 0;
++            if (!s_ni) {
++                extern void (*spu_take_interrupt(spu_context*, void (*)(spu_context*)))(spu_context*);
++                static volatile long s_tk = 0;
++                const uint32_t at = ctx->pc;
++                spu_take_interrupt(ctx, 0);
++                if (!ctx->int_enable && s_tk++ < 20)
++                    fprintf(stderr, "[spu-interp] interrupt taken at LS 0x%05X -> 0x%05X\n", at, ctx->pc & SPU_LS_MASK);
++                if (!ctx->int_enable) continue;   /* taken: run the handler from ctx->pc */
++            }
++        }
++        /* SPU_INTERP_PCTRACE=<lo>-<hi>[,<file>]: log every interpreted block entry (pc not the
++         * fall-through of the previous instruction) inside [lo,hi) with a few registers, to
++         * <file> (default spu_pctrace.txt), at most SPU_INTERP_PCTRACE_MAX lines (default 400000).
++         * MotorStorm port: follow the Wws job-manager PM (PS3_PM_NOLIFT=wwsjob). */
++        { static int s_pt = -1; static uint32_t s_lo, s_hi; static FILE* s_pf; static long long s_left;
++          static SPU_THREAD_LOCAL uint32_t t_prev = 0xFFFFFFFFu;
++          if (s_pt < 0) {
++              const char* e = getenv("SPU_INTERP_PCTRACE"); s_pt = 0;
++              if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, &d, 16);
++                       const char* fn = (*d == ',') ? d + 1 : "spu_pctrace.txt"; s_pf = fopen(fn, "w");
++                       const char* m = getenv("SPU_INTERP_PCTRACE_MAX"); s_left = m ? atoll(m) : 400000; s_pt = s_pf ? 1 : 0; } }
++          if (s_pt && s_left > 0 && ctx->pc >= s_lo && ctx->pc < s_hi && ctx->pc != t_prev + 4) {
++              s_left--;
++              fprintf(s_pf, "%05X spu=%X r3=%08X r4=%08X r5=%08X r6=%08X lr=%05X\n", ctx->pc, ctx->spu_id,
++                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0],
++                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
++              if ((s_left & 1023) == 0) fflush(s_pf);
++          }
++          t_prev = ctx->pc; }
+         if (_g1>0) {
+             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
+             if (inr) { _g1in = 1; }

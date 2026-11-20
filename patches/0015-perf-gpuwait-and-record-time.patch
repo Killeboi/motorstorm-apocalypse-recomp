@@ -1,0 +1,54 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 274bcb3..3a6227b 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -530,6 +530,7 @@ static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
+  * spend an afternoon optimising the wrong loop. */
+ static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
+ static double s_perf_gpu = 0.0, s_perf_pre = 0.0, s_perf_srv = 0.0, s_perf_pso = 0.0;
++static double s_perf_wait0 = 0.0, s_perf_rec = 0.0;   /* frame-start GPU drain; command recording */
+ static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0;
+ static u64    s_perf_nverts = 0;
+ static u64    s_perf_texbytes = 0;
+@@ -4627,7 +4628,9 @@ static void render_frame(void)
+      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+-    wait_for_gpu();
++    { double _w0 = perf_on() ? perf_now() : 0.0;
++      wait_for_gpu();
++      if (perf_on()) s_perf_wait0 += perf_now() - _w0; }
+     gfx_flush_deferred_releases();
+     rdoc_frame_begin(s_d3d.draw_count);
+ 
+@@ -5635,7 +5638,7 @@ static void render_frame(void)
+                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
+                             dr->cull, dr->blend, 10); } }
+             }
+-            if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
++            if (perf_on()) { s_perf_gpu += perf_now() - _rec0; s_perf_rec += perf_now() - _rec0; }
+             /* Leave the backbuffer bound for the dump/present epilogue. */
+             if (cur_rt >= 0) {
+                 s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+@@ -5711,18 +5714,20 @@ static void render_frame(void)
+             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
+             fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
+                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
+-                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
++                            " | gpuwait %.2fs rec %.2fs | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
+                     20.0 / fr,
+                     s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
+                     s_perf_vtx, 100.0 * s_perf_vtx / fr,
+                     (double)s_perf_nverts / 1000.0,
+                     s_perf_rf, 100.0 * s_perf_rf / fr,
++                    s_perf_wait0, s_perf_rec,
+                     s_perf_pre, 100.0 * s_perf_pre / fr,
+                     s_perf_srv, 100.0 * s_perf_srv / fr,
+                     s_perf_pso, 100.0 * s_perf_pso / fr,
+                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
+                     fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
+             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
++            s_perf_wait0 = 0.0; s_perf_rec = 0.0;
+             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
+             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
+             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;

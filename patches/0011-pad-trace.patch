@@ -1,0 +1,23 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index afdd93d..ba60435 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1120,6 +1120,18 @@ emit:
+      * attack firing once.
+      *
+      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
++    /* MotorStorm port: PAD_TRACE=1 reports what the guest actually receives: every packet with a
++     * digital button set (first 60), and a running count of reads and non-empty packets. */
++    { static int s_pt = -1; static unsigned long s_reads = 0, s_nonempty = 0; static int s_pressed = 0;
++      if (s_pt < 0) s_pt = getenv("PAD_TRACE") ? 1 : 0;
++      if (s_pt && port_no == 0) {
++          s_reads++; if (data->len) s_nonempty++;
++          const unsigned d1 = data->button[CELL_PAD_BTN_OFFSET_DIGITAL1], d2 = data->button[CELL_PAD_BTN_OFFSET_DIGITAL2];
++          if ((d1 | d2) && s_pressed < 60) { s_pressed++;
++              fprintf(stderr, "[pad-trace] read#%lu len=%d d1=0x%02X d2=0x%02X setting=0x%X\n", s_reads, (int)data->len, d1, d2, s_port_setting[0]); }
++          if ((s_reads & 0xFF) == 0)
++              fprintf(stderr, "[pad-trace] reads=%lu nonempty=%lu\n", s_reads, s_nonempty);
++      } }
+     {
+         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */

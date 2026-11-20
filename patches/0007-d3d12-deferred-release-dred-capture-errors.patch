@@ -1,0 +1,240 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index bc05a30..50a9bb3 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -620,7 +620,10 @@ static void rdoc_frame_end(void)
+  * capture reads in guest terms. */
+ static void rdoc_name(ID3D12Object* o, const char* fmt, ...)
+ {
+-    if (!s_rdoc || !o) return;
++    /* MotorStorm port: names also feed the DRED page-fault report (D3D12_DRED=1). */
++    static int s_dred_names = -1;
++    if (s_dred_names < 0) s_dred_names = getenv("D3D12_DRED") ? 1 : 0;
++    if ((!s_rdoc && !s_dred_names) || !o) return;
+     char s[160];
+     va_list ap;
+     va_start(ap, fmt);
+@@ -737,6 +740,21 @@ static int init_d3d12(u32 width, u32 height)
+         }
+     }
+ 
++    /* MotorStorm port: D3D12_DRED=1 records GPU breadcrumbs and page faults so a device
++     * removal can name the command that never finished (d3d12_report_device_removed). */
++    if (getenv("D3D12_DRED")) {
++        ID3D12DeviceRemovedExtendedDataSettings* dred = NULL;
++        hr = D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings, (void**)&dred);
++        if (SUCCEEDED(hr) && dred) {
++            dred->lpVtbl->SetAutoBreadcrumbsEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
++            dred->lpVtbl->SetPageFaultEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
++            dred->lpVtbl->Release(dred);
++            printf("[D3D12] DRED enabled\n");
++        } else {
++            printf("[D3D12] DRED unavailable (0x%08lX)\n", hr);
++        }
++    }
++
+     rdoc_load();   /* before the factory and device: RenderDoc hooks their creation */
+ 
+     /* Create DXGI factory */
+@@ -1471,6 +1489,37 @@ static void wait_for_gpu(void)
+     }
+ }
+ 
++/* MotorStorm port: wait_for_gpu only covers submitted work, so a resource the still-open
++ * command list refers to cannot be released on the spot: the GPU page-faults on it when the
++ * list is executed (DRED: unfinished CopyTextureRegion, fault in a recently freed resource,
++ * device hung). Hold such resources until render_frame's opening wait, when the list that
++ * used them has finished. */
++#define GFX_GRAVE_MAX 512
++static ID3D12Resource* s_gfx_grave[GFX_GRAVE_MAX];
++static u32 s_gfx_grave_n = 0;
++
++static void gfx_defer_release(ID3D12Resource* r, const char* what)
++{
++    if (!r) return;
++    { static int _n = 0;
++      if (_n < 16) { _n++;
++          fprintf(stderr, "[D3D12] deferred release of %s at frame %llu%c", what,
++                  (unsigned long long)s_d3d.frame_count, 10); } }
++    if (s_gfx_grave_n >= GFX_GRAVE_MAX) {   /* leaking is safe, releasing here is not */
++        static int _w = 0;
++        if (!_w) { _w = 1; fprintf(stderr, "[D3D12] deferred-release list full: leaking%c", 10); }
++        return;
++    }
++    s_gfx_grave[s_gfx_grave_n++] = r;
++}
++
++static void gfx_flush_deferred_releases(void)
++{
++    for (u32 i = 0; i < s_gfx_grave_n; i++)
++        s_gfx_grave[i]->lpVtbl->Release(s_gfx_grave[i]);
++    s_gfx_grave_n = 0;
++}
++
+ static void move_to_next_frame(void)
+ {
+     u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
+@@ -1566,7 +1615,7 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
+                           u32 pitch, u32 dxgi)
+ {
+     FILE* f = fopen(path, "wb");
+-    if (!f) return;
++    if (!f) { printf("[RSXCAP] cannot open %s\n", path); fflush(stdout); return; }
+     u32 rowb = (w * 3 + 3) & ~3u, datasz = rowb * h;
+     u8 hdr[54] = {0};
+     hdr[0] = 'B'; hdr[1] = 'M';
+@@ -1628,11 +1677,17 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+     rd.Width = (u64)pitch * h; rd.Height = 1; rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
++    /* MotorStorm port: every failure below used to return silently, leaving a manifest with no BMP. */
++    { HRESULT chr = s_d3d.device->lpVtbl->CreateCommittedResource(
+             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+-            &IID_ID3D12Resource, (void**)&rb)) || !rb)
+-        return;
++            &IID_ID3D12Resource, (void**)&rb);
++      if (FAILED(chr) || !rb) {
++          printf("[RSXCAP] readback buffer failed for %s: hr=0x%08lX removed=0x%08lX (%ux%u pitch=%u)\n",
++                 path, (long)chr, (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device), w, h, pitch);
++          fflush(stdout);
++          return;
++      } }
+ 
+     wait_for_gpu();
+     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+@@ -1681,14 +1736,69 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+     wait_for_gpu();
+ 
+     void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
+-    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
++    HRESULT mhr = rb->lpVtbl->Map(rb, 0, &rr, &mp);
++    if (SUCCEEDED(mhr) && mp) {
+         cap_write_bmp(path, mp, w, h, pitch, dxgi);
+         D3D12_RANGE wr = {0, 0};
+         rb->lpVtbl->Unmap(rb, 0, &wr);
++    } else {
++        printf("[RSXCAP] readback map failed for %s: hr=0x%08lX removed=0x%08lX\n",
++               path, (long)mhr, (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
++        fflush(stdout);
+     }
+     rb->lpVtbl->Release(rb);
+ }
+ 
++/* MotorStorm port: say once, loudly, when the device dies. Without this the guest keeps
++ * issuing draws into a dead device and the only symptom is a frozen window. Detection lags
++ * the hang by a frame or more. With D3D12_DRED=1 each command list that did not finish is
++ * listed with how far it got. */
++static void d3d12_report_device_removed(void)
++{
++    static int s_reported = 0;
++    if (s_reported) return;
++    HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
++    if (rr == S_OK) return;
++    s_reported = 1;
++    fprintf(stderr, "[D3D12-LOST] device removed: reason=0x%08lX frame=%llu last_frame_draws=%u\n",
++            (long)rr, (unsigned long long)s_d3d.frame_count, s_dbg_last_draws);
++    ID3D12DeviceRemovedExtendedData* d = NULL;
++    if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device,
++            &IID_ID3D12DeviceRemovedExtendedData, (void**)&d)) && d) {
++        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {0};
++        if (SUCCEEDED(d->lpVtbl->GetAutoBreadcrumbsOutput(d, &bc))) {
++            for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
++                const u32 done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
++                if (done >= n->BreadcrumbCount) continue;   /* this list finished */
++                u32 draws = 0;
++                for (u32 i = 0; i < done; i++)
++                    if (n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED ||
++                        n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED) draws++;
++                fprintf(stderr, "[D3D12-LOST] unfinished list: %u/%u ops done, %u draws done; ops around:",
++                        done, n->BreadcrumbCount, draws);
++                for (u32 i = done > 6 ? done - 6 : 0; i < done + 6 && i < n->BreadcrumbCount; i++)
++                    fprintf(stderr, " %s%d", i == done ? ">" : "", (int)n->pCommandHistory[i]);
++                fprintf(stderr, "\n");
++            }
++        } else fprintf(stderr, "[D3D12-LOST] no breadcrumbs (run with D3D12_DRED=1)\n");
++        D3D12_DRED_PAGE_FAULT_OUTPUT pf = {0};
++        if (SUCCEEDED(d->lpVtbl->GetPageFaultAllocationOutput(d, &pf))) {
++            fprintf(stderr, "[D3D12-LOST] page fault VA=0x%016llX\n", (unsigned long long)pf.PageFaultVA);
++            for (int k = 0; k < 2; k++) {
++                int shown = 0;
++                for (const D3D12_DRED_ALLOCATION_NODE* a = k ? pf.pHeadRecentFreedAllocationNode
++                                                             : pf.pHeadExistingAllocationNode;
++                     a && shown < 24; a = a->pNext, shown++)
++                    fprintf(stderr, "[D3D12-LOST] %s: type=%d name=%s\n", k ? "recently freed" : "at fault VA",
++                            (int)a->AllocationType, a->ObjectNameA ? a->ObjectNameA : "(none)");
++                if (!shown) fprintf(stderr, "[D3D12-LOST] %s: none\n", k ? "recently freed" : "at fault VA");
++            }
++        }
++        d->lpVtbl->Release(d);
++    }
++    fflush(stderr);
++}
++
+ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+ {
+     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
+@@ -3042,8 +3152,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+      * cube path copies 6 subresources and writes a 6x upload buffer -- which
+      * crashes. */
+     if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)) {
+-        t->res->lpVtbl->Release(t->res); t->res = NULL;
+-        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
++        gfx_defer_release(t->res, "texture"); t->res = NULL;
++        gfx_defer_release(t->up, "texture upload"); t->up = NULL;
+     }
+     if (!t->res) {
+         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -3077,6 +3187,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
+                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                 &IID_ID3D12Resource, (void**)&s_d3d.tex_ring))) {
++            rdoc_name((ID3D12Object*)s_d3d.tex_ring, "tex upload ring");
+             if (SUCCEEDED(s_d3d.tex_ring->lpVtbl->Map(s_d3d.tex_ring, 0, &nr0, &rp)) && rp)
+                 s_d3d.tex_ring_ptr = (u8*)rp;
+             else { s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring); s_d3d.tex_ring = NULL; }
+@@ -3762,8 +3873,8 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+          * replacement reads back empty. Let the GPU finish first. Recreations are
+          * rare (a surface changing size), so the stall costs nothing. */
+         wait_for_gpu();
+-        r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
+-        if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
++        gfx_defer_release(r->res, "render target"); r->res = NULL;   /* dims/format changed */
++        gfx_defer_release(r->up, "render target init upload"); r->up = NULL;
+     } else {
+         for (int i = 0; i < MAX_OFF_RTS; i++)
+             if (!s_d3d.off_rt[i].res) { slot = i; break; }
+@@ -3772,12 +3883,10 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
+             if (slot < 0) return -1;
+             wait_for_gpu();   /* same hazard as above: the frame may still use it */
+-            s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
++            gfx_defer_release(s_d3d.off_rt[slot].res, "evicted render target");
+             s_d3d.off_rt[slot].res = NULL;
+-            if (s_d3d.off_rt[slot].up) {
+-                s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
+-                s_d3d.off_rt[slot].up = NULL;
+-            }
++            gfx_defer_release(s_d3d.off_rt[slot].up, "evicted render target init upload");
++            s_d3d.off_rt[slot].up = NULL;
+         }
+     }
+     OffRT* r = &s_d3d.off_rt[slot];
+@@ -4430,6 +4539,7 @@ static void render_frame(void)
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+     wait_for_gpu();
++    gfx_flush_deferred_releases();
+     rdoc_frame_begin(s_d3d.draw_count);
+ 
+     /* Compile the real vertex program once its microcode is captured, and keep
+@@ -5839,6 +5949,8 @@ skip_dump_consider: ;
+         }
+       } }
+ 
++    d3d12_report_device_removed();
++
+     /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
+      * title past the display's rate. Skipped for an offscreen-only batch. */
+     if (s_present_this_frame) {
