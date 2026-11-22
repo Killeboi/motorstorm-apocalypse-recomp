@@ -163,20 +163,6 @@ Not affiliated with Sony Interactive Entertainment or Evolution Studios. *MotorS
 trademark of its respective owners. No copyrighted game assets or code are distributed here;
 you must own the game. Source code in this repository is MIT-licensed.
 
----
-
-<details>
-<summary>🇷🇺 <b>Кратко по-русски</b></summary>
-
-<br>
-
-Открытый нативный порт MotorStorm Apocalypse на ПК через статическую рекомпиляцию (ps3recomp), не эмулятор.
-Готовность **~25 %**. На EU-версии (Killeboi, спасибо Shad) меню идут плавно, игра загружается в гонку,
-играет стартовый звук, но **зависает на загрузке трассы**. 3D-фоны меню пока чёрные.
-Файлов игры в репозитории нет. Подробный журнал лежит в `NOTES.md`. Помощь приветствуется!
-
-</details>
-
 <div align="center">
 <br>
 <img src="assets/icon.png" width="40" alt="">
