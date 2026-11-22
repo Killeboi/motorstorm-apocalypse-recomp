@@ -33,3 +33,6 @@ port/spu_jobs/
 *.png
 *.dds
 *.hlsl
+# README artwork is ours to publish
+!assets/
+!assets/*.png

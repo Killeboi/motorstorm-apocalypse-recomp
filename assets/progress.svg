@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="452" viewBox="0 0 840 452">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1a0c05"/><stop offset="1" stop-color="#070605"/></linearGradient>
+<linearGradient id="hot" x1="0" x2="1"><stop offset="0" stop-color="#ff4d00"/><stop offset="1" stop-color="#ffb000"/></linearGradient>
+<linearGradient id="mid" x1="0" x2="1"><stop offset="0" stop-color="#c2410c"/><stop offset="1" stop-color="#ff7a00"/></linearGradient>
+<linearGradient id="cold" x1="0" x2="1"><stop offset="0" stop-color="#7a1505"/><stop offset="1" stop-color="#c2310c"/></linearGradient>
+<radialGradient id="glow" cx="0.85" cy="0" r="0.8"><stop offset="0" stop-color="#ff6a00" stop-opacity=".28"/><stop offset="1" stop-color="#ff6a00" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="840" height="452" rx="16" fill="url(#bg)"/>
+<rect width="840" height="452" rx="16" fill="url(#glow)"/>
+<rect x="1" y="1" width="838" height="450" rx="15" fill="none" stroke="#ff6a00" stroke-opacity=".55" stroke-width="2"/>
+<text x="32" y="46" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3" fill="#ff8a2a">PORT STATUS</text>
+<text x="32" y="92" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="44" font-weight="800" fill="#ffffff">~25%</text>
+<text x="170" y="74" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#f5d0b0">Boots, menus run, loads into a race —</text>
+<text x="170" y="96" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#f5d0b0">then freezes on track load. Not playable yet.</text>
+<rect x="32" y="112" width="776" height="12" rx="6" fill="#2a1408"/>
+<rect x="32" y="112" width="194" height="12" rx="6" fill="url(#hot)"/>
+<text x="32" y="175" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">PPU recompilation</text>
+<rect x="290" y="164" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="164" width="428" height="10" rx="5" fill="url(#hot)"/>
+<text x="808" y="175" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">95%</text>
+<text x="32" y="209" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Boot / OS / HLE</text>
+<rect x="290" y="198" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="198" width="338" height="10" rx="5" fill="url(#hot)"/>
+<text x="808" y="209" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">75%</text>
+<text x="32" y="243" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Firmware LLE</text>
+<rect x="290" y="232" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="232" width="360" height="10" rx="5" fill="url(#hot)"/>
+<text x="808" y="243" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">80%</text>
+<text x="32" y="277" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">SPU (SPURS, jobs, DSP)</text>
+<rect x="290" y="266" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="266" width="248" height="10" rx="5" fill="url(#hot)"/>
+<text x="808" y="277" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">55%</text>
+<text x="32" y="311" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Graphics  RSX → D3D12</text>
+<rect x="290" y="300" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="300" width="135" height="10" rx="5" fill="url(#mid)"/>
+<text x="808" y="311" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">30%</text>
+<text x="32" y="345" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Video &amp; audio</text>
+<rect x="290" y="334" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="334" width="90" height="10" rx="5" fill="url(#cold)"/>
+<text x="808" y="345" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">20%</text>
+<text x="32" y="379" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Gameplay / races</text>
+<rect x="290" y="368" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="368" width="45" height="10" rx="5" fill="url(#cold)"/>
+<text x="808" y="379" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">10%</text>
+<text x="32" y="413" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#e8e2dc">Performance</text>
+<rect x="290" y="402" width="450" height="10" rx="5" fill="#2a1408"/>
+<rect x="290" y="402" width="112" height="10" rx="5" fill="url(#mid)"/>
+<text x="808" y="413" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" text-anchor="end" fill="#ff9a3c">25%</text>
+<text x="808" y="438" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" text-anchor="end" fill="#8a7a6e">rough estimates · updated 2026-11-22</text>
+</svg>
