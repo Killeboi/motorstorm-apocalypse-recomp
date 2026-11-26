@@ -1,0 +1,40 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 34bcc418..5201fab0 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -198,7 +198,16 @@ typedef struct {
+  * and room for 64 offscreen targets + 16 depth surfaces below the draw windows. */
+ #define VP_TEX_UNITS 16
+ #define DRAW_SRV_BASE 128
+-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
++/* x2: the per-draw SRV windows are split per vp_parity half like the constant buffers. With one set, recording
++ * frame N+1 rewrote the windows while the GPU could still be executing frame N (move_to_next_frame only waits for
++ * N-1), so a draw of frame N could sample a texture of a different draw of frame N+1 (MotorStorm Apocalypse: its
++ * 320x180 lens/blur map picked up the scene copy). SRV_PARSPLIT=0 = old (one set). */
++#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS * 2)
++static u32 draw_srv_window(u32 d, int parity)
++{
++    static int on = -1; if (on < 0) { const char* e = getenv("SRV_PARSPLIT"); on = !(e && e[0] == '0'); }
++    return DRAW_SRV_BASE + ((on ? (u32)(parity & 1) * MAX_DRAWS : 0u) + d) * VP_TEX_UNITS;
++}
+ 
+ /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
+  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
+@@ -5193,7 +5202,7 @@ static void render_frame(void)
+          * texture, or a null SRV. */
+         double _sv0 = perf_on() ? perf_now() : 0.0;
+         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
+-            u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
++            u32 wslot = draw_srv_window(_d, s_d3d.vp_parity) + (u32)_u;
+             dr->tex_rt[_u] = -1;
+             /* A depth surface read as a texture: its colour copy (made in the
+              * RT pre-pass), refreshed from the depth buffer just before this
+@@ -5772,7 +5781,7 @@ static void render_frame(void)
+                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                 }
+                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
+-                gh.ptr += (u64)(DRAW_SRV_BASE + d * VP_TEX_UNITS) * s_d3d.srv_inc;
++                gh.ptr += (u64)draw_srv_window(d, s_d3d.vp_parity) * s_d3d.srv_inc;
+                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                 if (s_d3d.samp_heap) {
+                     D3D12_GPU_DESCRIPTOR_HANDLE sb;

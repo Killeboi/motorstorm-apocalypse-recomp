@@ -1,0 +1,160 @@
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index a39639f1..7d059c70 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -617,6 +617,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         return 0;
+     }
+ 
++    if (method == NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE) { state->dbt_enable = data; return 0; }
++    if (method == NV4097_SET_DEPTH_BOUNDS_MIN) { state->dbt_min = data; return 0; }
++    if (method == NV4097_SET_DEPTH_BOUNDS_MAX) { state->dbt_max = data; return 0; }
++
+     /* Alpha test */
+     if (method == NV4097_SET_ALPHA_TEST_ENABLE) {
+         state->alpha_test_enable = data ? 1 : 0;
+diff --git a/libs/video/rsx_commands.h b/libs/video/rsx_commands.h
+index 246ca166..cd9e9a34 100644
+--- a/libs/video/rsx_commands.h
++++ b/libs/video/rsx_commands.h
+@@ -298,6 +298,7 @@ typedef struct rsx_state {
+     int two_sided_stencil;
+     u32 back_stencil_func, back_stencil_ref, back_stencil_mask, back_stencil_write_mask;
+     u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
++    u32 dbt_enable, dbt_min, dbt_max;   /* NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE / MIN / MAX (float bits) */
+ 
+     /* Culling */
+     int cull_face_enable;
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 1310dd77..34bcc418 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -97,6 +97,7 @@ typedef struct {
+                          * through and shade unlit (black). */
+     u64 zs_key;         /* packed guest depth/stencil state (rsx_zs_key), PSO key */
+     u32 stencil_ref;    /* guest stencil reference at draw time (dynamic state) */
++    u32 dbt_min, dbt_max;   /* depth bounds (float bits), used when zs_key bit 50 is set */
+     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
+                          * (wave's sim passes write single lanes of the height
+                          * maps; ignoring the mask stomped persistent state) */
+@@ -2375,6 +2376,19 @@ static u64 rsx_zs_key(const rsx_state* st)
+     return k;
+ }
+ 
++/* Depth bounds test (RSX 0x380-0x388): MotorStorm restricts each sun/shadow-cascade pass to its depth slice
++ * with it. Ignored, every cascade pass lit the whole screen. Bit 50 of zs_key selects a PSO with
++ * DepthBoundsTestEnable; the bounds are set per draw with OMSetDepthBounds. DBT_OFF=1 = old behaviour. */
++static void rec_dbt(D3D12DrawRecord* dr)
++{
++    static int off = -1; if (off < 0) off = getenv("DBT_OFF") ? 1 : 0;
++    const rsx_state* st = s_d3d.current_rsx_state;
++    if (off || !st || !st->dbt_enable) return;
++    dr->zs_key |= 1ull << 50; dr->dbt_min = st->dbt_min; dr->dbt_max = st->dbt_max;
++    { static int n = 0; float a, b; memcpy(&a, &st->dbt_min, 4); memcpy(&b, &st->dbt_max, 4);
++      if (PS3_LOG_FIRST(n, 8)) fprintf(stderr, "[DBT] depth bounds %.5f..%.5f%c", a, b, 10); }
++}
++
+ static u32 rsx_blend_key(const rsx_state* st, int enable)
+ {
+     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
+@@ -2459,6 +2473,46 @@ static void vp_fp_cache_put(const VPFPEntry* e)
+     s_d3d.vp_fp[s_d3d.vp_fp_n++] = *e;
+ }
+ 
++/* A graphics PSO with DepthBoundsTestEnable (only reachable through the pipeline-state stream API). */
++static void pss_push(unsigned char* buf, size_t* off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const void* v, size_t sz, size_t al)
++{
++    size_t o = (*off + 7) & ~(size_t)7;
++    memcpy(buf + o, &type, sizeof type);
++    size_t vo = (o + sizeof type + (al - 1)) & ~(al - 1);
++    memcpy(buf + vo, v, sz);
++    *off = (vo + sz + 7) & ~(size_t)7;
++}
++static HRESULT create_pso_dbt(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
++{
++    static ID3D12Device2* dev2 = NULL; static int tried = 0;
++    if (!tried) { tried = 1; s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device2, (void**)&dev2); }
++    if (!dev2) return E_NOINTERFACE;
++    unsigned char buf[2048]; size_t off = 0;
++    D3D12_DEPTH_STENCIL_DESC1 ds1;
++    ds1.DepthEnable = pd->DepthStencilState.DepthEnable; ds1.DepthWriteMask = pd->DepthStencilState.DepthWriteMask;
++    ds1.DepthFunc = pd->DepthStencilState.DepthFunc; ds1.StencilEnable = pd->DepthStencilState.StencilEnable;
++    ds1.StencilReadMask = pd->DepthStencilState.StencilReadMask; ds1.StencilWriteMask = pd->DepthStencilState.StencilWriteMask;
++    ds1.FrontFace = pd->DepthStencilState.FrontFace; ds1.BackFace = pd->DepthStencilState.BackFace;
++    ds1.DepthBoundsTestEnable = TRUE;
++    struct D3D12_RT_FORMAT_ARRAY rtf; memset(&rtf, 0, sizeof rtf);
++    rtf.NumRenderTargets = pd->NumRenderTargets;
++    for (UINT i = 0; i < 8; i++) rtf.RTFormats[i] = pd->RTVFormats[i];
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &pd->pRootSignature, sizeof(void*), 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &pd->VS, sizeof pd->VS, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &pd->PS, sizeof pd->PS, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &pd->BlendState, sizeof pd->BlendState, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &pd->SampleMask, sizeof pd->SampleMask, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &pd->RasterizerState, sizeof pd->RasterizerState, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &ds1, sizeof ds1, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &pd->InputLayout, sizeof pd->InputLayout, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, &pd->IBStripCutValue, sizeof pd->IBStripCutValue, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &pd->PrimitiveTopologyType, sizeof pd->PrimitiveTopologyType, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rtf, sizeof rtf, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &pd->DSVFormat, sizeof pd->DSVFormat, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &pd->SampleDesc, sizeof pd->SampleDesc, 4);
++    D3D12_PIPELINE_STATE_STREAM_DESC sd; sd.SizeInBytes = off; sd.pPipelineStateSubobjectStream = buf;
++    return dev2->lpVtbl->CreatePipelineState(dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
++}
+ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
+                                           u32 cube_mask, u64 zs)
+@@ -2895,6 +2949,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     pd.SampleDesc.Count = 1;
+ 
+     ID3D12PipelineState* pso = NULL;
++    if ((zs >> 50) & 1ull) {
++        hr = create_pso_dbt(&pd, &pso);
++        { static int n = 0; if (PS3_LOG_FIRST(n, 4)) fprintf(stderr, "[DBT] depth-bounds PSO fp=0x%08X hr=0x%08lX%c", fp_addr, (unsigned long)hr, 10); }
++    } else
+     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+     pb->lpVtbl->Release(pb);
+@@ -5659,6 +5717,15 @@ static void render_frame(void)
+                                                 dr_cube_mask(dr), dr->zs_key) : NULL;
+                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
+                                                          dpso ? dpso : vpso);
++                if ((dr->zs_key >> 50) & 1ull) {   /* depth bounds (rec_dbt) */
++                    static ID3D12GraphicsCommandList1* cl1 = NULL; static ID3D12GraphicsCommandList* cl1_of = NULL;
++                    if (cl1_of != s_d3d.cmd_list) { cl1_of = s_d3d.cmd_list; cl1 = NULL;
++                        s_d3d.cmd_list->lpVtbl->QueryInterface(s_d3d.cmd_list, &IID_ID3D12GraphicsCommandList1, (void**)&cl1);
++                        if (cl1) cl1->lpVtbl->Release(cl1); }
++                    if (cl1) { float mn, mx; memcpy(&mn, &dr->dbt_min, 4); memcpy(&mx, &dr->dbt_max, 4);
++                               if (!(mn >= 0.0f)) mn = 0.0f; if (!(mx <= 1.0f)) mx = 1.0f; if (mx < mn) mx = mn;
++                               cl1->lpVtbl->OMSetDepthBounds(cl1, mn, mx); }
++                }
+                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                 if (cur_z >= 0 && (dr->zs_key & (2u | (1u << 5)))) s_d3d.off_ds[cur_z].gen++;
+                 /* Per-draw viewport: the guest rect when sane, else the
+@@ -7447,7 +7514,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+                 dr->is_vp          = 1;
+                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+                 dr->fp_ctrl = rec_fp_ctrl();
+-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+                 dr->cmask = 0xF;
+@@ -7569,7 +7636,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+             dr->is_vp          = 1;
+             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+             dr->fp_ctrl = rec_fp_ctrl();
+-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->cmask = 0xF;
+@@ -7739,7 +7806,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+         dr->is_vp          = 1;
+         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+         dr->fp_ctrl = rec_fp_ctrl();
+-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+         dr->cmask = 0xF;
+         if (s_d3d.current_rsx_state) {

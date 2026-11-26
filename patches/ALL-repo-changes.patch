@@ -1878,3 +1878,319 @@ index 8b463d28..752ab930 100644
      const long long vs_t0 = vs_begin_indexed(s_d3d.current_rsx_state, primitive, first, count);
      int ix_used = 0, ix_cont = 0;
      const u32 ib0 = s_d3d.vp_ib_offset;
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index ec14726c..97078b35 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -308,6 +308,52 @@ static void out_puts(Out* o, const char* s)
+     o->p[o->len] = '\0';
+ }
+ 
++/* NV40 fragment registers alias: the 128-bit R[n] is the pair H[2n], H[2n+1] (four fp16 each), with
++ * R[n].x = H[2n].xy, R[n].y = H[2n].zw, R[n].z = H[2n+1].xy, R[n].w = H[2n+1].zw (x in the low 16 bits).
++ * Shaders rely on it - MotorStorm Apocalypse packs its screen-space motion vectors by writing h0.xy and
++ * unpacking r0.x with UP4UB (RPCS3 emits packHalf2x16 for the same). The decompiler keeps r[] and h[]
++ * as separate arrays, so after every register write the other view is brought up to date here.
++ * FP_ALIAS_OFF=1 = old behaviour (separate files). */
++static int fp_alias_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("FP_ALIAS_OFF") ? 0 : 1;
++    return v;
++}
++static void emit_alias_sync(Out* o, int half, u32 idx, const char* m)
++{
++    if (!fp_alias_on()) return;
++    char b[640];
++    const int hx = strchr(m, 'x') != NULL, hy = strchr(m, 'y') != NULL;
++    const int hz = strchr(m, 'z') != NULL, hw = strchr(m, 'w') != NULL;
++    if (half) {
++        if (idx >= 48) return;
++        const u32 n = idx / 2;
++        const char* lo = (idx & 1) ? "z" : "x";
++        const char* hi = (idx & 1) ? "w" : "y";
++        if (hx || hy) {
++            snprintf(b, sizeof b, "    r[%u].%s = asfloat(f32tof16(h[%u].x) | (f32tof16(h[%u].y) << 16));\n", n, lo, idx, idx);
++            out_puts(o, b);
++        }
++        if (hz || hw) {
++            snprintf(b, sizeof b, "    r[%u].%s = asfloat(f32tof16(h[%u].z) | (f32tof16(h[%u].w) << 16));\n", n, hi, idx, idx);
++            out_puts(o, b);
++        }
++    } else {
++        if (2 * idx + 1 >= 48) return;
++        const char comps[4] = { 'x', 'y', 'z', 'w' };
++        const int has[4] = { hx, hy, hz, hw };
++        for (int c = 0; c < 4; c++) {
++            if (!has[c]) continue;
++            const u32 t = 2 * idx + (c >= 2 ? 1u : 0u);
++            const char* pair = (c == 0 || c == 2) ? "xy" : "zw";
++            snprintf(b, sizeof b, "    { uint _u = asuint(r[%u].%c); h[%u].%s = float2(f16tof32(_u & 0xFFFFu), f16tof32(_u >> 16)); }\n",
++                     idx, comps[c], t, pair);
++            out_puts(o, b);
++        }
++    }
++}
++
+ /* Decoded view of one source word. */
+ typedef struct {
+     u32 type;       /* FP_REG_TYPE_* */
+@@ -1168,6 +1214,7 @@ static int rsx_fp_decompile_internal(
+                 const int target = fp_export_target(dst_idx, dst_half);
+                 if (target >= 0) wrote[dst_half][target] = 1;
+             }
++            if (has_dest && !is_never) emit_alias_sync(&o, dst_half, dst_idx, m);
+         }
+ 
+         if (w0 & FP_END) break;
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 752ab930..1310dd77 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -73,6 +73,10 @@
+ /* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
+  * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
+ #define VP_FPCB_STRIDE    1280
++/* Upper bound on a fragment program read from guest memory. It used to be 4096 bytes, which cut long programs off:
++ * MotorStorm Apocalypse's SSAO pass (fp 0x0052F241, 185 instructions + ~80 inline constants) lost its last 33
++ * instructions -- the AO result -- and the AO buffer stayed 0. Scans stop at the END flag, so this is only a cap. */
++#define RSX_FP_MAX_UCODE 32768u
+ #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
+ 
+ typedef struct {
+@@ -2486,7 +2490,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+      * so hashing them made the pipeline key move every draw. */
+     u32 uhash;
+     {
+-        u32 usz = rsx_fp_program_size(vm_base + off, 4096);
++        u32 usz = rsx_fp_program_size(vm_base + off, RSX_FP_MAX_UCODE);
+         if (usz == 0) usz = 64;
+         s_perf_pso_hashbytes += (int)usz;
+         static int consts_inline = -1;
+@@ -2497,7 +2501,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+             const u8* up = vm_base + off;
+             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
+         } else {
+-            uhash = rsx_fp_code_hash(vm_base + off, 4096);
++            uhash = rsx_fp_code_hash(vm_base + off, RSX_FP_MAX_UCODE);
+         }
+     }
+ 
+@@ -2585,7 +2589,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     static int ctrl_auto = -1;
+     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
+-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
++    int n = rsx_fp_decompile(vm_base + off, RSX_FP_MAX_UCODE, fp_ctrl, hlsl, sizeof(hlsl));
+     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); VP_FP_STORE(NULL); return NULL; }
+     /* FP_LIST=1: every program the title actually compiles, with its size. A
+      * fragment program that hangs the GPU shows up here as an implausible
+@@ -3674,7 +3678,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
+                                              dr->fp_addr & ~0x3u);
+             if (vm_base && foff != 0xFFFFFFFFu)
+-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
++                rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_UCODE, &ts[20], 64);   /* fp_k[64] */
+             /* FPK_DBG=1: the fragment constants as the shader will see them.
+              * A program whose only output is fp_k[0].xxxx renders black if
+              * those constants never arrive, which looks identical from the
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index a39639f1..7d059c70 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -617,6 +617,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         return 0;
+     }
+ 
++    if (method == NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE) { state->dbt_enable = data; return 0; }
++    if (method == NV4097_SET_DEPTH_BOUNDS_MIN) { state->dbt_min = data; return 0; }
++    if (method == NV4097_SET_DEPTH_BOUNDS_MAX) { state->dbt_max = data; return 0; }
++
+     /* Alpha test */
+     if (method == NV4097_SET_ALPHA_TEST_ENABLE) {
+         state->alpha_test_enable = data ? 1 : 0;
+diff --git a/libs/video/rsx_commands.h b/libs/video/rsx_commands.h
+index 246ca166..cd9e9a34 100644
+--- a/libs/video/rsx_commands.h
++++ b/libs/video/rsx_commands.h
+@@ -298,6 +298,7 @@ typedef struct rsx_state {
+     int two_sided_stencil;
+     u32 back_stencil_func, back_stencil_ref, back_stencil_mask, back_stencil_write_mask;
+     u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
++    u32 dbt_enable, dbt_min, dbt_max;   /* NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE / MIN / MAX (float bits) */
+ 
+     /* Culling */
+     int cull_face_enable;
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 1310dd77..34bcc418 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -97,6 +97,7 @@ typedef struct {
+                          * through and shade unlit (black). */
+     u64 zs_key;         /* packed guest depth/stencil state (rsx_zs_key), PSO key */
+     u32 stencil_ref;    /* guest stencil reference at draw time (dynamic state) */
++    u32 dbt_min, dbt_max;   /* depth bounds (float bits), used when zs_key bit 50 is set */
+     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
+                          * (wave's sim passes write single lanes of the height
+                          * maps; ignoring the mask stomped persistent state) */
+@@ -2375,6 +2376,19 @@ static u64 rsx_zs_key(const rsx_state* st)
+     return k;
+ }
+ 
++/* Depth bounds test (RSX 0x380-0x388): MotorStorm restricts each sun/shadow-cascade pass to its depth slice
++ * with it. Ignored, every cascade pass lit the whole screen. Bit 50 of zs_key selects a PSO with
++ * DepthBoundsTestEnable; the bounds are set per draw with OMSetDepthBounds. DBT_OFF=1 = old behaviour. */
++static void rec_dbt(D3D12DrawRecord* dr)
++{
++    static int off = -1; if (off < 0) off = getenv("DBT_OFF") ? 1 : 0;
++    const rsx_state* st = s_d3d.current_rsx_state;
++    if (off || !st || !st->dbt_enable) return;
++    dr->zs_key |= 1ull << 50; dr->dbt_min = st->dbt_min; dr->dbt_max = st->dbt_max;
++    { static int n = 0; float a, b; memcpy(&a, &st->dbt_min, 4); memcpy(&b, &st->dbt_max, 4);
++      if (PS3_LOG_FIRST(n, 8)) fprintf(stderr, "[DBT] depth bounds %.5f..%.5f%c", a, b, 10); }
++}
++
+ static u32 rsx_blend_key(const rsx_state* st, int enable)
+ {
+     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
+@@ -2459,6 +2473,46 @@ static void vp_fp_cache_put(const VPFPEntry* e)
+     s_d3d.vp_fp[s_d3d.vp_fp_n++] = *e;
+ }
+ 
++/* A graphics PSO with DepthBoundsTestEnable (only reachable through the pipeline-state stream API). */
++static void pss_push(unsigned char* buf, size_t* off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const void* v, size_t sz, size_t al)
++{
++    size_t o = (*off + 7) & ~(size_t)7;
++    memcpy(buf + o, &type, sizeof type);
++    size_t vo = (o + sizeof type + (al - 1)) & ~(al - 1);
++    memcpy(buf + vo, v, sz);
++    *off = (vo + sz + 7) & ~(size_t)7;
++}
++static HRESULT create_pso_dbt(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
++{
++    static ID3D12Device2* dev2 = NULL; static int tried = 0;
++    if (!tried) { tried = 1; s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device2, (void**)&dev2); }
++    if (!dev2) return E_NOINTERFACE;
++    unsigned char buf[2048]; size_t off = 0;
++    D3D12_DEPTH_STENCIL_DESC1 ds1;
++    ds1.DepthEnable = pd->DepthStencilState.DepthEnable; ds1.DepthWriteMask = pd->DepthStencilState.DepthWriteMask;
++    ds1.DepthFunc = pd->DepthStencilState.DepthFunc; ds1.StencilEnable = pd->DepthStencilState.StencilEnable;
++    ds1.StencilReadMask = pd->DepthStencilState.StencilReadMask; ds1.StencilWriteMask = pd->DepthStencilState.StencilWriteMask;
++    ds1.FrontFace = pd->DepthStencilState.FrontFace; ds1.BackFace = pd->DepthStencilState.BackFace;
++    ds1.DepthBoundsTestEnable = TRUE;
++    struct D3D12_RT_FORMAT_ARRAY rtf; memset(&rtf, 0, sizeof rtf);
++    rtf.NumRenderTargets = pd->NumRenderTargets;
++    for (UINT i = 0; i < 8; i++) rtf.RTFormats[i] = pd->RTVFormats[i];
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &pd->pRootSignature, sizeof(void*), 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &pd->VS, sizeof pd->VS, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &pd->PS, sizeof pd->PS, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &pd->BlendState, sizeof pd->BlendState, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &pd->SampleMask, sizeof pd->SampleMask, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &pd->RasterizerState, sizeof pd->RasterizerState, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &ds1, sizeof ds1, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &pd->InputLayout, sizeof pd->InputLayout, 8);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, &pd->IBStripCutValue, sizeof pd->IBStripCutValue, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &pd->PrimitiveTopologyType, sizeof pd->PrimitiveTopologyType, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rtf, sizeof rtf, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &pd->DSVFormat, sizeof pd->DSVFormat, 4);
++    pss_push(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &pd->SampleDesc, sizeof pd->SampleDesc, 4);
++    D3D12_PIPELINE_STATE_STREAM_DESC sd; sd.SizeInBytes = off; sd.pPipelineStateSubobjectStream = buf;
++    return dev2->lpVtbl->CreatePipelineState(dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
++}
+ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
+                                           u32 cube_mask, u64 zs)
+@@ -2895,6 +2949,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     pd.SampleDesc.Count = 1;
+ 
+     ID3D12PipelineState* pso = NULL;
++    if ((zs >> 50) & 1ull) {
++        hr = create_pso_dbt(&pd, &pso);
++        { static int n = 0; if (PS3_LOG_FIRST(n, 4)) fprintf(stderr, "[DBT] depth-bounds PSO fp=0x%08X hr=0x%08lX%c", fp_addr, (unsigned long)hr, 10); }
++    } else
+     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+     pb->lpVtbl->Release(pb);
+@@ -5659,6 +5717,15 @@ static void render_frame(void)
+                                                 dr_cube_mask(dr), dr->zs_key) : NULL;
+                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
+                                                          dpso ? dpso : vpso);
++                if ((dr->zs_key >> 50) & 1ull) {   /* depth bounds (rec_dbt) */
++                    static ID3D12GraphicsCommandList1* cl1 = NULL; static ID3D12GraphicsCommandList* cl1_of = NULL;
++                    if (cl1_of != s_d3d.cmd_list) { cl1_of = s_d3d.cmd_list; cl1 = NULL;
++                        s_d3d.cmd_list->lpVtbl->QueryInterface(s_d3d.cmd_list, &IID_ID3D12GraphicsCommandList1, (void**)&cl1);
++                        if (cl1) cl1->lpVtbl->Release(cl1); }
++                    if (cl1) { float mn, mx; memcpy(&mn, &dr->dbt_min, 4); memcpy(&mx, &dr->dbt_max, 4);
++                               if (!(mn >= 0.0f)) mn = 0.0f; if (!(mx <= 1.0f)) mx = 1.0f; if (mx < mn) mx = mn;
++                               cl1->lpVtbl->OMSetDepthBounds(cl1, mn, mx); }
++                }
+                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                 if (cur_z >= 0 && (dr->zs_key & (2u | (1u << 5)))) s_d3d.off_ds[cur_z].gen++;
+                 /* Per-draw viewport: the guest rect when sane, else the
+@@ -7447,7 +7514,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+                 dr->is_vp          = 1;
+                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+                 dr->fp_ctrl = rec_fp_ctrl();
+-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+                 dr->cmask = 0xF;
+@@ -7569,7 +7636,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+             dr->is_vp          = 1;
+             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+             dr->fp_ctrl = rec_fp_ctrl();
+-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+             dr->cmask = 0xF;
+@@ -7739,7 +7806,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+         dr->is_vp          = 1;
+         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+         dr->fp_ctrl = rec_fp_ctrl();
+-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
++        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); rec_dbt(dr); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+         dr->cmask = 0xF;
+         if (s_d3d.current_rsx_state) {
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 34bcc418..5201fab0 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -198,7 +198,16 @@ typedef struct {
+  * and room for 64 offscreen targets + 16 depth surfaces below the draw windows. */
+ #define VP_TEX_UNITS 16
+ #define DRAW_SRV_BASE 128
+-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS)
++/* x2: the per-draw SRV windows are split per vp_parity half like the constant buffers. With one set, recording
++ * frame N+1 rewrote the windows while the GPU could still be executing frame N (move_to_next_frame only waits for
++ * N-1), so a draw of frame N could sample a texture of a different draw of frame N+1 (MotorStorm Apocalypse: its
++ * 320x180 lens/blur map picked up the scene copy). SRV_PARSPLIT=0 = old (one set). */
++#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * VP_TEX_UNITS * 2)
++static u32 draw_srv_window(u32 d, int parity)
++{
++    static int on = -1; if (on < 0) { const char* e = getenv("SRV_PARSPLIT"); on = !(e && e[0] == '0'); }
++    return DRAW_SRV_BASE + ((on ? (u32)(parity & 1) * MAX_DRAWS : 0u) + d) * VP_TEX_UNITS;
++}
+ 
+ /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
+  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
+@@ -5193,7 +5202,7 @@ static void render_frame(void)
+          * texture, or a null SRV. */
+         double _sv0 = perf_on() ? perf_now() : 0.0;
+         for (int _u = 0; _u < VP_TEX_UNITS; _u++) {
+-            u32 wslot = DRAW_SRV_BASE + _d * VP_TEX_UNITS + (u32)_u;
++            u32 wslot = draw_srv_window(_d, s_d3d.vp_parity) + (u32)_u;
+             dr->tex_rt[_u] = -1;
+             /* A depth surface read as a texture: its colour copy (made in the
+              * RT pre-pass), refreshed from the depth buffer just before this
+@@ -5772,7 +5781,7 @@ static void render_frame(void)
+                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                 }
+                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
+-                gh.ptr += (u64)(DRAW_SRV_BASE + d * VP_TEX_UNITS) * s_d3d.srv_inc;
++                gh.ptr += (u64)draw_srv_window(d, s_d3d.vp_parity) * s_d3d.srv_inc;
+                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                 if (s_d3d.samp_heap) {
+                     D3D12_GPU_DESCRIPTOR_HANDLE sb;

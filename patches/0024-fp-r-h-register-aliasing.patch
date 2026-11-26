@@ -1,0 +1,65 @@
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index ec14726c..97078b35 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -308,6 +308,52 @@ static void out_puts(Out* o, const char* s)
+     o->p[o->len] = '\0';
+ }
+ 
++/* NV40 fragment registers alias: the 128-bit R[n] is the pair H[2n], H[2n+1] (four fp16 each), with
++ * R[n].x = H[2n].xy, R[n].y = H[2n].zw, R[n].z = H[2n+1].xy, R[n].w = H[2n+1].zw (x in the low 16 bits).
++ * Shaders rely on it - MotorStorm Apocalypse packs its screen-space motion vectors by writing h0.xy and
++ * unpacking r0.x with UP4UB (RPCS3 emits packHalf2x16 for the same). The decompiler keeps r[] and h[]
++ * as separate arrays, so after every register write the other view is brought up to date here.
++ * FP_ALIAS_OFF=1 = old behaviour (separate files). */
++static int fp_alias_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("FP_ALIAS_OFF") ? 0 : 1;
++    return v;
++}
++static void emit_alias_sync(Out* o, int half, u32 idx, const char* m)
++{
++    if (!fp_alias_on()) return;
++    char b[640];
++    const int hx = strchr(m, 'x') != NULL, hy = strchr(m, 'y') != NULL;
++    const int hz = strchr(m, 'z') != NULL, hw = strchr(m, 'w') != NULL;
++    if (half) {
++        if (idx >= 48) return;
++        const u32 n = idx / 2;
++        const char* lo = (idx & 1) ? "z" : "x";
++        const char* hi = (idx & 1) ? "w" : "y";
++        if (hx || hy) {
++            snprintf(b, sizeof b, "    r[%u].%s = asfloat(f32tof16(h[%u].x) | (f32tof16(h[%u].y) << 16));\n", n, lo, idx, idx);
++            out_puts(o, b);
++        }
++        if (hz || hw) {
++            snprintf(b, sizeof b, "    r[%u].%s = asfloat(f32tof16(h[%u].z) | (f32tof16(h[%u].w) << 16));\n", n, hi, idx, idx);
++            out_puts(o, b);
++        }
++    } else {
++        if (2 * idx + 1 >= 48) return;
++        const char comps[4] = { 'x', 'y', 'z', 'w' };
++        const int has[4] = { hx, hy, hz, hw };
++        for (int c = 0; c < 4; c++) {
++            if (!has[c]) continue;
++            const u32 t = 2 * idx + (c >= 2 ? 1u : 0u);
++            const char* pair = (c == 0 || c == 2) ? "xy" : "zw";
++            snprintf(b, sizeof b, "    { uint _u = asuint(r[%u].%c); h[%u].%s = float2(f16tof32(_u & 0xFFFFu), f16tof32(_u >> 16)); }\n",
++                     idx, comps[c], t, pair);
++            out_puts(o, b);
++        }
++    }
++}
++
+ /* Decoded view of one source word. */
+ typedef struct {
+     u32 type;       /* FP_REG_TYPE_* */
+@@ -1168,6 +1214,7 @@ static int rsx_fp_decompile_internal(
+                 const int target = fp_export_target(dst_idx, dst_half);
+                 if (target >= 0) wrote[dst_half][target] = 1;
+             }
++            if (has_dest && !is_never) emit_alias_sync(&o, dst_half, dst_idx, m);
+         }
+ 
+         if (w0 & FP_END) break;
